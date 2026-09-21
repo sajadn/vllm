@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -11,6 +11,7 @@ from vllm.exceptions import VLLMValidationError
 @dataclass
 class MockModelConfig:
     is_diffusion: bool = False
+    architectures: list[str] = field(default_factory=list)
     max_logprobs: int = 20
     logits_processors: list | None = None
 
@@ -35,6 +36,18 @@ def test_diffusion_rejects_unsupported_params(kwargs: dict):
     params = SamplingParams(**kwargs)
     with pytest.raises(VLLMValidationError, match="not yet supported with diffusion"):
         params.verify(MockModelConfig(is_diffusion=True), None, None, None)
+
+
+def test_nemotron_diffusion_accepts_greedy():
+    params = SamplingParams(temperature=0.0)
+    params.verify(
+        MockModelConfig(
+            is_diffusion=True, architectures=["NemotronLabsDiffusionModel"]
+        ),
+        None,
+        None,
+        None,
+    )
 
 
 def test_diffusion_accepts_default_params():
