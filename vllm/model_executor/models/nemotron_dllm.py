@@ -21,6 +21,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.models.config import NemotronDiffusionOptions
 from vllm.model_executor.models.llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -477,20 +478,19 @@ class NemotronLabsDiffusionModelState(ModelState):
 
         hf_config = self.model_config.hf_config
         diffusion_config = vllm_config.diffusion_config
-        canvas_length = (
-            diffusion_config.canvas_length
-            if diffusion_config is not None
-            else getattr(hf_config, "canvas_length", 32)
-        )
+        assert diffusion_config is not None
+        options = diffusion_config.model_options
+        assert isinstance(options, NemotronDiffusionOptions)
+        canvas_length = diffusion_config.canvas_length
         gen_config = self.model_config.try_get_generation_config()
         # Default to one unmasked token per step (HF steps == gen_length).
         max_denoising_steps = (
-            (diffusion_config.max_denoising_steps if diffusion_config else None)
+            diffusion_config.max_denoising_steps
             or gen_config.get("max_denoising_steps")
             or canvas_length
         )
         selection = (
-            (diffusion_config.selection_policy if diffusion_config else None)
+            options.selection_policy
             or gen_config.get("diffusion_selection_policy")
             or "confidence_threshold"
         )
@@ -500,7 +500,7 @@ class NemotronLabsDiffusionModelState(ModelState):
         # Probability threshold for selection_policy="confidence_threshold"
         # (SGLang FastDiffuser thresholding). None-checks rather than `or`
         # so an explicit small value is honored.
-        threshold = diffusion_config.confidence_threshold if diffusion_config else None
+        threshold = options.confidence_threshold
         if threshold is None:
             threshold = gen_config.get("diffusion_confidence_threshold")
         if threshold is None:

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeVar
 
+from pydantic import Field
+
+from vllm.config import utils as config_utils
+from vllm.config.diffusion import DiffusionConfig, DiffusionModelOptions
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -23,6 +27,27 @@ class VerifyAndUpdateConfig:
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         return
+
+
+_OptionsT = TypeVar("_OptionsT", bound=DiffusionModelOptions)
+
+
+def _parse_diffusion_model_options(
+    vllm_config: "VllmConfig", options_cls: type[_OptionsT]
+) -> _OptionsT:
+    """Validate `--diffusion-config` `model_options` against `options_cls`."""
+    diffusion_config = vllm_config.diffusion_config
+    assert diffusion_config is not None
+    options = diffusion_config.model_options
+    if isinstance(options, dict):
+        options = options_cls(**options)
+    if not isinstance(options, options_cls):
+        raise TypeError(
+            f"Expected {options_cls.__name__} diffusion model_options, "
+            f"got {type(options).__name__}."
+        )
+    diffusion_config.model_options = options
+    return options
 
 
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
@@ -315,6 +340,28 @@ class EmbeddingGemma2ModelConfig(Gemma4Config):
             model_config.max_model_len = 8192
 
 
+@config_utils.config
+class DiffusionGemmaDiffusionOptions(DiffusionModelOptions):
+    """DiffusionGemma `DiffusionConfig.model_options`. Unset options are read
+    from the model's generation_config.json."""
+
+    t_min: float | None = None
+    """Temperature at the last denoising step."""
+
+    t_max: float | None = None
+    """Temperature at the first denoising step."""
+
+    entropy_bound: float | None = Field(default=None, gt=0)
+    """Entropy budget for the EntropyBound sampler."""
+
+    confidence_threshold: float | None = None
+    """Confidence above which a position is committed."""
+
+    stability_threshold: int | None = Field(default=None, ge=0)
+    """Number of previous steps a prediction must match before it is
+    committed."""
+
+
 class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -350,14 +397,14 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
             )
 
         # Auto-create DiffusionConfig from HF config if not provided.
+        canvas_length = getattr(
+            vllm_config.model_config.hf_config, "canvas_length", 256
+        )
         if vllm_config.diffusion_config is None:
-            from vllm.config.diffusion import DiffusionConfig
-
-            hf_config = vllm_config.model_config.hf_config
-            canvas_length = getattr(hf_config, "canvas_length", 256)
-            vllm_config.diffusion_config = DiffusionConfig(
-                canvas_length=canvas_length,
-            )
+            vllm_config.diffusion_config = DiffusionConfig(canvas_length=canvas_length)
+        elif vllm_config.diffusion_config.canvas_length is None:
+            vllm_config.diffusion_config.canvas_length = canvas_length
+        _parse_diffusion_model_options(vllm_config, DiffusionGemmaDiffusionOptions)
 
         # The diffusion sampler materializes [num_seqs, canvas_length, vocab]
         # fp32 transients, so concurrency is memory-bound (>8 OOMs a single H200).
@@ -384,6 +431,34 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
                 "from generation_config.json (use "
                 "--override-generation-config to set a custom limit).",
             )
+
+
+@config_utils.config
+class NemotronDiffusionOptions(DiffusionModelOptions):
+    """Nemotron Labs Diffusion `DiffusionConfig.model_options`."""
+
+    temperature: float | None = Field(default=None, ge=0)
+    """Default sampling temperature; explicit request temperatures take
+    precedence. 0 means greedy. If unset, the model's generation defaults
+    apply."""
+
+    selection_policy: (
+        Literal["low_confidence", "leftmost", "confidence_threshold"] | None
+    ) = None
+    """Which masked positions to unmask each denoising step.
+    ``low_confidence``: the most confident predictions first (LLaDA),
+    top-k per step with k from the even transfer schedule.
+    ``leftmost``: strictly left-to-right.
+    ``confidence_threshold``: unmask every position whose chosen-token
+    probability exceeds ``confidence_threshold`` (always at least the single
+    most confident one, so each step makes progress).
+    If not set, read from the model's generation_config.json
+    (``diffusion_selection_policy``), defaulting to ``confidence_threshold``."""
+
+    confidence_threshold: float | None = Field(default=None, gt=0, lt=1)
+    """Probability threshold for ``selection_policy="confidence_threshold"``.
+    If not set, read from the model's generation_config.json
+    (``diffusion_confidence_threshold``), defaulting to 0.9."""
 
 
 class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
@@ -432,8 +507,6 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
         # canvas_length from the HF config.
         hf_config = vllm_config.model_config.hf_config
         if vllm_config.diffusion_config is None:
-            from vllm.config.diffusion import DiffusionConfig
-
             vllm_config.diffusion_config = DiffusionConfig(
                 canvas_length=getattr(hf_config, "canvas_length", 32),
             )
@@ -441,12 +514,13 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
             vllm_config.diffusion_config.canvas_length = getattr(
                 hf_config, "canvas_length", 32
             )
+        options = _parse_diffusion_model_options(vllm_config, NemotronDiffusionOptions)
 
         # Use the ordinary generation defaults; explicit request temperatures
         # always take precedence over this compatibility setting.
-        if vllm_config.diffusion_config.temperature is not None:
+        if options.temperature is not None:
             model_config.override_generation_config.setdefault(
-                "temperature", vllm_config.diffusion_config.temperature
+                "temperature", options.temperature
             )
 
         # The diffusion sampler materializes [num_seqs, canvas_length, vocab]
